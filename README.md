@@ -1,117 +1,134 @@
 # qq-db-bridge
 
-**一个不一样的 QQ 接入思路：不碰协议，只读本地库、用客户端自己发。**
+**A different way to bridge QQ into an agent: don't touch the protocol — read the local message store, and let the client send.**
 
-大多数 QQ 机器人走协议库（NapCat / Lagrange / OneBot）。这个仓库走另一条路：
+[中文说明](README.zh-CN.md) · English
+
+Most QQ bots go through a protocol library (NapCat / Lagrange / OneBot). This repo takes another route:
 
 ```
-读取 NTQQ 本地消息库（只读，差分轮询）
+read the local NTQQ message store (read-only, diff polling)
         ↓
-把新消息映射成统一的 ChatEvent，交给你的 Agent / 业务层
+map new rows into a unified ChatEvent and hand them to your agent / business layer
         ↓
-需要回复时，驱动一个真实的 QQ 客户端把消息发出去
+when a reply is needed, drive a real QQ client to send it
 ```
 
-它不是可直接部署的机器人，而是**一套可移植的架构 + 三段核心实现说明**，用来嵌进你自己的 Agent 框架（DeepSeek Harness、自研 harness、任意脚本都行）。
+It is **not** a deployable bot. It is an architecture plus three implementation notes you can embed into your own agent framework (DeepSeek Harness, a custom harness, or plain scripts).
+
+> This repository intentionally contains **no key-extraction tooling** and no personal data.
+> It documents how to read and send *once you already have* a local store and its key.
 
 ---
 
-## 为什么这么做
+## Why this approach
 
-| 维度 | 协议路线（NapCat 等） | 本方案（库读 + 客户端发送） |
+| | Protocol route (NapCat etc.) | This approach (store read + client send) |
 |---|---|---|
-| 需要逆向协议 / 实现登录 | 需要 | **不需要**，客户端自己登录 |
-| 掉线、风控 | 取决于协议实现 | 跟着官方客户端走 |
-| 消息完整性 | 协议推送 | 本地库就是全量历史，可回放、可补采 |
-| 延迟 | 实时推送（更低） | 轮询间隔（实测 3 秒一轮，单轮 200ms 内） |
-| 群聊 @ 判定 | 协议事件字段 | `group_at_me_msg` 表（精确） |
-| 发送 | 协议发送 | 驱动客户端 UI（**最脆弱的一环**） |
+| Protocol reverse-engineering / login | Required | **Not required** — the client logs in itself |
+| Disconnects, risk control | Depends on the implementation | Follows the official client |
+| Message completeness | Push-only | The local store *is* the history — replayable, backfillable |
+| Latency | Real-time push (better) | Polling interval (3 s measured, ~200 ms per round) |
+| Group @ detection | Protocol event fields | `group_at_me_msg` table (precise) |
+| Sending | Protocol send | Driving the client UI (**the fragile part**) |
 
-**适合**：个人单机、只想给自己的 Agent 接一个能收发的 IM、不接受协议逆向风险、能忍受几秒延迟。
+**Good fit:** single machine, personal agent, you want an IM channel without protocol reverse-engineering, and a few seconds of latency is fine.
 
-**不适合**：多账号、高并发、需要毫秒级响应、要发给大量陌生人。
+**Bad fit:** multi-account, high concurrency, millisecond responses, talking to many strangers.
 
 ---
 
-## 架构
+## Architecture
 
 ```
-┌────────────────────────────── 你的机器 ──────────────────────────────┐
+┌────────────────────────────── your machine ──────────────────────────┐
 │                                                                       │
 │  ┌─────────────┐   copy + strip 1024B + SQLCipher   ┌──────────────┐  │
-│  │  NTQQ 客户端 │ ─────────────────────────────────→ │  Reader 模块  │  │
-│  │ nt_msg.db   │                                     │  (只读)       │  │
-│  └─────────────┘                                     └──────┬───────┘  │
-│         ▲                                                   │          │
-│         │ 写                                              ChatEvent[]  │
-│         │                                                   ▼          │
+│  │  QQ client  │ ─────────────────────────────────→ │   Reader     │  │
+│  │ nt_msg.db   │                                    │  (read-only) │  │
+│  └─────────────┘                                    └──────┬───────┘  │
+│         ▲                                                  │          │
+│         │ writes                                      ChatEvent[]     │
+│         │                                                  ▼          │
 │  ┌─────────────┐                                    ┌──────────────┐   │
-│  │ Sender 模块  │ ←──────── 回复文本 ─────────────── │  Agent 层     │   │
-│  │ (驱动客户端) │                                    │  策略/审核/模型│   │
+│  │  Sender     │ ←──────────── reply text ────────── │  Agent layer  │   │
+│  │ (drives UI) │                                    │ policy/model  │   │
 │  └─────────────┘                                    └──────────────┘   │
 │                                                                       │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-模块契约见 [`docs/04-architecture.md`](docs/04-architecture.md)，TypeScript 接口见 [`src/types.ts`](src/types.ts)。
+Module contracts live in [`docs/04-architecture.md`](docs/04-architecture.md); the TypeScript interfaces are in [`src/types.ts`](src/types.ts).
 
 ---
 
-## 三段核心实现
+## The three core pieces
 
-| 文档 | 内容 |
+| Doc | What it covers |
 |---|---|
-| [01-ntqq-db-decrypt.md](docs/01-ntqq-db-decrypt.md) | 1024 字节私有头、SQLCipher pragma 顺序、表与字段映射、**WAL 必须跟着剥头后的库同名** |
-| [02-diff-polling.md](docs/02-diff-polling.md) | 序列差分（LCS）、去重键设计、快照窗口、歧义时 fail-closed |
-| [03-send-via-linux-qq.md](docs/03-send-via-linux-qq.md) | Xvfb 下驱动客户端、中文必须剪贴板粘贴、**UI 回执 + 数据库回读双校验** |
+| [01-ntqq-db-decrypt.md](docs/01-ntqq-db-decrypt.md) | the 1024-byte private header, SQLCipher pragma order, table/column mapping, and the **WAL must be renamed to match the stripped DB** trap |
+| [02-diff-polling.md](docs/02-diff-polling.md) | sequence diffing (LCS), dedupe key design, snapshot window, failing closed on ambiguity |
+| [03-send-via-linux-qq.md](docs/03-send-via-linux-qq.md) | driving the client under Xvfb, CJK input must go through the clipboard, **UI acknowledgment + database read-back double check** |
 
-可运行的最小骨架在 [`examples/`](examples)。
+Minimal runnable skeletons are in [`examples/`](examples).
 
 ---
 
-## 快速试用（Linux）
+## Quick start (Linux)
 
 ```bash
-# 1) 用你自己的方式拿到库和密钥（本仓库不提供密钥提取工具）
-export QQ_DB=/path/to/nt_msg.db          # 客户端生成的本地库
-export QQ_DB_KEY='<16 字节密钥>'          # 由你的环境提供，不要写进仓库
+# 1) Bring your own store and key (no key extractor here)
+export QQ_DB=/path/to/nt_msg.db
+export QQ_DB_KEY='<16-byte key>'        # provided by your environment, never commit it
+export QQ_SELF_UIN='<your uin>'         # used to tell inbound from outbound
 
-# 2) 读最近 20 条
+# 2) Read the last 20 messages
 python3 examples/read_messages.py --limit 20
 
-# 3) 差分轮询（每 3 秒，打印新增消息）
+# 3) Diff polling (every 3 s, print only new messages)
 python3 examples/diff_poll.py --interval 3
 ```
 
-发送示例（需要 Xvfb + 已登录的 Linux QQ）：
+Sending (needs Xvfb and a logged-in Linux QQ):
 
 ```bash
-bash examples/send_via_linuxqq.sh "你好，这是测试" "群名或好友名"
+bash examples/send_via_linuxqq.sh "hello" "chat name"
 ```
 
 ---
 
-## 设计原则（血的教训）
+## Design principles (lessons paid for in production)
 
-1. **发送必须双重校验**：只看「输入框被清空」会误判成功；要用**客户端自己的数据库回读**确认消息真的进了会话。
-2. **fail-closed 必须配自愈**：一笔结果未知的发送会堵住后续所有发送；要有按数据库核对后自动解锁的机制，否则一次误判就永久哑掉。
-3. **去重键要带平台消息 id**：只用「发送者+文本」做键，同一个人连发两条相同文字会被合并成一条。
-4. **@ 语义要分开**：`@我` / `@全体成员` / `@别人` 在库里表现不同，`@全体` 往往也被记成「@到我」。
-5. **中文只能粘贴**：`xdotool type` 发不出非 ASCII，必须走剪贴板 PRIMARY + 中键粘贴。
-
----
-
-## 风险与边界（务必先读）
-
-- 违反腾讯服务条款，有**封号**风险；
-- 本仓库**不包含**任何密钥提取工具，也不鼓励绕过客户端的保护；
-- 客户端升级可能改表结构、改 UI 布局，Sending 模块最易失效；
-- 杀软（如国内的 HIPS）会拦截脚本驱动输入，需要自行加白。
-
-完整说明见 [`docs/05-risks-and-limits.md`](docs/05-risks-and-limits.md)。
+1. **Sending needs two checks.** "The input box got cleared" is not proof; read back the client's own database and confirm the message actually landed.
+2. **Fail-closed needs self-healing.** One unknown-outcome send blocks everything after it. Reconcile unresolved attempts against the database, or a single false negative silences the bot forever.
+3. **The dedupe key must include the platform message id.** A sender+text key silently merges two genuinely identical consecutive messages.
+4. **`@all` is not `@me`.** Both land in `group_at_me_msg`; you must inspect the text to tell them apart.
+5. **CJK input must be pasted.** `xdotool type` turns non-ASCII into `?`; use the PRIMARY selection and a middle click.
+6. **WAL files must match the stripped DB name.** Otherwise you read a point-in-time snapshot from tens of minutes ago.
 
 ---
 
-## 许可
+## Risks and limits (read before use)
 
-代码 MIT；文档 CC BY 4.0。仅供个人学习与自用，作者不对账号风险、数据丢失负责。
+- Automating a client typically **violates the service's terms of use** and can get the account banned.
+- This repo contains **no key-extraction tooling** and does not encourage circumventing client protection.
+- Client upgrades may change table schemas or UI layout; the Sender is the first thing to break.
+- Security software may block synthetic input; whitelist deliberately, not blindly.
+
+See [`docs/05-risks-and-limits.md`](docs/05-risks-and-limits.md).
+
+---
+
+## Roadmap
+
+- [ ] Timestamp-incremental reads (instead of a fixed window)
+- [ ] Local small model for topic detection (instead of regex)
+- [ ] Multi-account / multi-instance routing
+- [ ] Attachment (image/file) capture and classification
+- [ ] Web admin panel
+
+---
+
+## License
+
+Code under MIT; docs under CC BY 4.0. For personal learning and self-hosting only. The authors are not responsible for account bans or data loss.
