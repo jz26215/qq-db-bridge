@@ -102,11 +102,7 @@ def main() -> int:
 
     print(f"polling {db_path} every {args.interval}s ...")
     while True:
-        events = []
-        for table, kind in (("c2c_msg_table", "c2c"), ("group_msg_table", "group")):
-            for row in rm.rows(conn, table, args.limit):
-                events.append(rm.to_event(row, kind, self_uin, at_me))
-        events.sort(key=lambda e: e["ts"])
+        events = rm.read_window(conn, self_uin, at_me, args.limit)
 
         result = diff(load_snapshot(), events)
         if result["ambiguous"]:

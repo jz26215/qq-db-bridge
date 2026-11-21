@@ -21,6 +21,10 @@ import tempfile
 
 HEADER_BYTES = 1024
 
+# 两张表的列顺序不同，分开写清楚，避免 SELECT 不存在的列
+C2C_COLUMNS = "[40001],[40020],[40021],[40030],[40033],[40050],[40800]"
+GROUP_COLUMNS = "[40001],[40020],[40021],[40027],[40033],[40050],[40090],[40800]"
+
 
 def strip_header(src_path: str, dst_path: str) -> None:
     with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
@@ -70,25 +74,28 @@ def extract_text(blob: bytes) -> str:
     if not blob:
         return ""
     text = blob.decode("utf-8", "ignore")
-    # 去掉不可打印字符，保留中英文/标点/emoji
     return "".join(ch for ch in text if ch.isprintable() or ch in "\n\t").strip()
 
 
-def rows(conn, table: str, limit: int):
-    sql = (
-        f"SELECT [40001],[40020],[40021],[40027],[40030],[40033],[40050],[40090],[40800] "
-        f"FROM {table} ORDER BY [40050] DESC LIMIT ?"
-    )
+def rows(conn, kind: str, limit: int):
+    """kind: 'c2c' | 'group'；返回最近 limit 条（时间倒序）。"""
+    if kind == "c2c":
+        sql = f"SELECT {C2C_COLUMNS} FROM c2c_msg_table ORDER BY [40050] DESC LIMIT ?"
+    else:
+        sql = f"SELECT {GROUP_COLUMNS} FROM group_msg_table ORDER BY [40050] DESC LIMIT ?"
     return list(conn.execute(sql, (limit,)))
 
 
 def to_event(row, kind: str, self_uin: str, at_me_ids: set) -> dict:
-    msg_id, sender_uid, peer_uid, group_code, peer_uin, sender_uin, ts, card, blob = row
-    out = str(sender_uin) == str(self_uin)
-    if kind == "group":
-        chat_id = str(group_code or "")
-    else:
+    if kind == "c2c":
+        msg_id, sender_uid, peer_uid, peer_uin, sender_uin, ts, blob = row
+        group_code, card = "", ""
         chat_id = str(peer_uid or "")
+    else:
+        msg_id, sender_uid, group_code, group_code2, sender_uin, ts, card, blob = row
+        chat_id = str(group_code or group_code2 or "")
+
+    out = str(sender_uin) == str(self_uin)
     text = extract_text(blob)
     mention = "none"
     if "@全体成员" in text or "@所有人" in text:
@@ -111,6 +118,15 @@ def to_event(row, kind: str, self_uin: str, at_me_ids: set) -> dict:
     }
 
 
+def read_window(conn, self_uin: str, at_me_ids: set, limit: int):
+    events = []
+    for kind in ("c2c", "group"):
+        for row in rows(conn, kind, limit):
+            events.append(to_event(row, kind, self_uin, at_me_ids))
+    events.sort(key=lambda e: e["ts"])
+    return events
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=20)
@@ -127,13 +143,7 @@ def main() -> int:
     conn = open_db(stripped, key)
     at_me = load_at_me_ids(conn)
 
-    events = []
-    for table, kind in (("c2c_msg_table", "c2c"), ("group_msg_table", "group")):
-        for row in rows(conn, table, args.limit):
-            events.append(to_event(row, kind, self_uin, at_me))
-
-    events.sort(key=lambda e: e["ts"])
-    for ev in events:
+    for ev in read_window(conn, self_uin, at_me, args.limit):
         print(json.dumps(ev, ensure_ascii=False))
     return 0
 
